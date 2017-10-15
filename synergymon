@@ -1,4 +1,4 @@
-#!/usr/bin/env python
+#!/usr/bin/python3
 
 import os
 import subprocess
@@ -9,6 +9,8 @@ import Xlib.display
 import fcntl
 import errno
 import socket
+import process
+import sys
 
 DVORAK, QWERTY = 0, 1
 LINUX, WINDOWS = 0, 1
@@ -19,11 +21,11 @@ LINUX_LAYOUT, WINDOWS_LAYOUT = DVORAK, DVORAK
 DEVNULL = os.open(os.devnull, os.O_RDWR)
 
 def read_lines(fd):
-  buf = ""
+  buf = b""
   while True:
     try:
       f = os.read(fd, 8192)
-    except OSError, e:
+    except OSError as e:
       if e.errno == errno.EAGAIN:
         yield None
         continue
@@ -31,7 +33,7 @@ def read_lines(fd):
 
     if not f:
       break
-    tokens = (buf + f).split("\n")
+    tokens = (buf + f).split(b"\n")
     buf = tokens.pop(-1)
     for line in tokens:
       yield line
@@ -46,14 +48,14 @@ def determine_layout():
   data = os.read(p.stdout.fileno(), 65535)
   p.stdout.close()
 
-  for l in data.split("\n"):
-    if not l.startswith("layout: "):
+  for l in data.split(b"\n"):
+    if not l.startswith(b"layout: "):
       continue
 
     value = l.split(None, 2)[1]
-    if value == "dvorak":
+    if value == b"dvorak":
       return DVORAK
-    if value == "gb":
+    if value == b"gb":
       return QWERTY
     break
 
@@ -64,7 +66,7 @@ def beep():
 
 SOCKET = None
 def switch_layout():
-  print "must switch layout..."
+  print("must switch layout...")
 
   global SOCKET
   if SOCKET is None:
@@ -72,30 +74,64 @@ def switch_layout():
     SOCKET.connect(("192.168.180.1", 5566))
 
   time.sleep(0.2)
-  SOCKET.send("keyboard")
+  SOCKET.send(b"keyboard")
   beep()
 
 def dump():
-  print "{position=%s, linux=%s, windows=%s}" % ("linux" if POSITION == LINUX else "windows", "dvorak" if LINUX_LAYOUT == DVORAK else "qwerty", "dvorak" if WINDOWS_LAYOUT == DVORAK else "qwerty")
+  print("{position=%s, linux=%s, windows=%s}" % ("linux" if POSITION == LINUX else "windows", "dvorak" if LINUX_LAYOUT == DVORAK else "qwerty", "dvorak" if WINDOWS_LAYOUT == DVORAK else "qwerty"))
+
+LAST_QEMU = None
+def get_qemu_tids():
+  global LAST_QEMU
+  if LAST_QEMU is not None:
+    pid, start_time, tids = LAST_QEMU
+    if process.start_time(pid) == start_time:
+      return tids
+
+  pid = process.find_qemu_vm(QEMU_BINARY, VM_UUID)
+  if pid is None:
+    return None
+
+  start_time = process.start_time(pid)
+  tids = list(process.get_cpu_tids(pid))
+  LAST_QEMU = pid, start_time, tids
+  print("updated qemu thread ids:", tids)
+  return tids
+
+def set_priority(rt):
+  tids = get_qemu_tids()
+  if not tids:
+    return
+
+  print("set priority", "rt" if rt else "ot")
+
+  try:
+    process.set_rt(tids, rt)
+  except PermissionError:
+    print("permission error -- use capwrap")
+  except OSError:
+    pass
 
 def enter_linux():
-  print "entering linux..."
+  print("entering linux...")
 
   global POSITION
   POSITION = LINUX
   if WINDOWS_LAYOUT != LINUX_LAYOUT:
     switch_layout()
 
+  set_priority(False)
   dump()
 
 def enter_windows():
-  print "entering windows..."
+  print("entering windows...")
 
   global POSITION
   POSITION = WINDOWS
   if WINDOWS_LAYOUT != LINUX_LAYOUT:
     switch_layout()
 
+  set_priority(True)
   dump()
 
 def terminating():
@@ -103,7 +139,7 @@ def terminating():
   pass
 
 def layout_changed():
-  print "layout changed"
+  print("layout changed")
 
   global WINDOWS_LAYOUT, LINUX_LAYOUT
   new_layout = determine_layout()
@@ -121,21 +157,21 @@ def handle_stdin(reader):
     if line is None:
       return
 
-    print line
-    if not line or line[0] != "[":
+    os.write(1, line + b"\n")
+    if not line or line[0] != ord(b"["):
       continue
 
     l = line[20:]
-    if l == "] INFO: leaving screen":
+    if l == b"] INFO: leaving screen":
       enter_windows()
-    elif l == "] INFO: entering screen":
+    elif l == b"] INFO: entering screen":
       enter_linux()
 
 def handle_display_event(event):
   if event.type != 34 or event.request != 0:
     return
 
-  print "display event triggered"
+  print("display event triggered")
   layout_changed()
 
 def handle_display(display):
@@ -149,7 +185,12 @@ def set_nonblocking(fd):
   flags = fcntl.fcntl(0, fcntl.F_GETFL, 0) | os.O_NONBLOCK
   fcntl.fcntl(0, fcntl.F_SETFL, flags)
 
-def main():
+def main(qemu_binary, vm_uuid):
+  # HACK
+  global QEMU_BINARY, VM_UUID
+  QEMU_BINARY = qemu_binary
+  VM_UUID = vm_uuid
+
   dump()
 
   set_nonblocking(0)
@@ -176,7 +217,10 @@ def main():
   terminating()
 
 if __name__ == "__main__":
+  if len(sys.argv) < 3:
+    print("args: %s [qemu binary] [vm uuid]" % sys.argv[0], file=sys.stderr)
+    sys.exit(1)
   try:
-    main()
+    main(sys.argv[1], sys.argv[2])
   except KeyboardInterrupt:
     pass
